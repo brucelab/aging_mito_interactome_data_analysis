@@ -1,0 +1,977 @@
+---
+title: "Mitochondrial interactome in aged muscle
+author: "Anna Bakhtina"
+date: "04/04/22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## required packages and libraries
+```{r}
+
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+library(svglite)
+library(ggrepel)
+library("broom")
+library(RColorBrewer)
+
+
+#install.packages("broom")
+#install.packages("RColorBrewer")
+#install.packages('svglite')
+#install.packages()
+```
+
+## load XLinkDB file
+```{r}
+# upload excel tables from XLinkDB
+input_all <- read_excel('C:/Users/BruceLab/Downloads/old_young_XLinkdb_output_final.xlsx')
+
+# make a data frame with XLs, gene names, ratios, p-values. 95% intervals
+mito_old_young <- input_all %>%
+  mutate(crosslink = str_c(pepA, "_", modposA, "_", pepB, "_", modposB)) %>%
+  select(crosslink, uniprotA, uniprotB, modposA, modposB, geneA, geneB, log2ratio_1_Sample_1, log2ratio_2_Sample_2, log2ratio_3_Sample_3, log2ratio_4_Sample_4, log2ratio_5_Combined_ratio, pvalue_1_Sample_1, pvalue_2_Sample_2, pvalue_3_Sample_3, pvalue_4_Sample_4, pvalue_5_Combined_ratio, `95pctconf_1_Sample_1`, `95pctconf_2_Sample_2`, `95pctconf_3_Sample_3`, `95pctconf_4_Sample_4`, `95pctconf_5_Combined_ratio`, K_means_5, NetworkDistance) %>%
+  mutate(log10pval = -log10(pvalue_5_Combined_ratio)) %>%
+  mutate(XL_protein_name = str_c(uniprotA, "_", modposA, "_", uniprotB, "_", modposB)) %>%
+  mutate(XL_protein_name = str_remove_all(XL_protein_name, "_MOUSE"))
+
+```
+
+
+## Volcano plot (Fig. 2e)
+```{r}
+
+# function to count number of NA across the columns
+count_NA <- function(x) {sum(is.na(x))}
+
+# select crosslinks with no more than 1 missing values across biological replicates
+old_young_all_quants <- mito_old_young %>%
+  mutate(NA_count = apply(.[c('log2ratio_1_Sample_1', 'log2ratio_2_Sample_2', 'log2ratio_3_Sample_3', 'log2ratio_4_Sample_4')], 1, count_NA)) %>%
+  filter(NA_count < 3)
+
+#filtered XLs (1 miss value max, 95% < 0.5 for the final ratio)
+old_young_all_quants_filtered <- mito_old_young %>%
+filter(`95pctconf_5_Combined_ratio` < 0.5) %>%
+  mutate(NA_count = apply(.[c('log2ratio_1_Sample_1', 'log2ratio_2_Sample_2', 'log2ratio_3_Sample_3', 'log2ratio_4_Sample_4')], 1, count_NA)) %>%
+  filter(NA_count < 3)
+
+# XLs_by_res_pair_P1 <- old_young_all_quants_filtered %>%
+#   group_by(XL_protein_name) %>%
+#   summarise(res_level_ratio = mean(log2ratio_1_Sample_1))
+
+# significantly changed crosslinks for STRING analysis
+sig_changers <- old_young_all_quants_filtered %>%
+  filter(pvalue_5_Combined_ratio <= 5.5e-5)
+
+write.csv(sig_changers, 'C:/Users/BruceLab/Desktop/aging_sig_changers.csv')
+         
+# confident increasing ratios
+filtered_pos <- old_young_all_quants_filtered %>%                      
+  filter(log2ratio_5_Combined_ratio >= 0 & pvalue_5_Combined_ratio <= 5.5e-5)
+
+# confident decreasing ratios
+filtered_neg <- old_young_all_quants_filtered %>%
+  filter(log2ratio_5_Combined_ratio < 0 & pvalue_5_Combined_ratio <= 5.5e-5)
+
+# confident non-changing crosslinks
+filtered_non_sig <- old_young_all_quants_filtered %>%
+  filter(pvalue_5_Combined_ratio > 5.5e-5)
+
+# volcano plot with 95% conf < 0.5 and 2 miss values
+volcano_old_young_colored <- ggplot(filtered_pos, aes(x = log2ratio_5_Combined_ratio, y = log10pval)) +
+  geom_point(color = 'yellow3') +
+  theme_classic() +
+  geom_hline(yintercept = -log10(0.000055), colour = "black", size = 1, alpha = 0.7) +
+  xlim(-2.0, 2.0) +
+  geom_point(data = filtered_neg,
+             aes(x = log2ratio_5_Combined_ratio, y = log10pval), color = "blue") +
+  geom_point(data = filtered_non_sig,
+             aes(x = log2ratio_5_Combined_ratio, y = log10pval), color = "black")
+    
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/volcano_old_young_colored.svg", plot = volcano_old_young_colored, width = 10, height = 8)
+
+# ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/volcano_old_young_colored_DHE3.svg", plot = volcano_old_young_colored, width = 10, height = 8)
+```
+
+## Distributions of the log2 ratios in each biological replicate (Fig. 2b)
+```{r}
+
+mito_long_filtered <- old_young_all_quants_filtered %>%
+  pivot_longer(c(log2ratio_1_Sample_1, log2ratio_2_Sample_2, log2ratio_3_Sample_3, log2ratio_4_Sample_4), names_to = "biorep", values_to = "log2ratio")
+
+# distributions for all 4 replicates
+all4_dist_filtered <- ggplot(mito_long_filtered, aes(x = log2ratio)) + 
+  geom_density(aes(group = biorep, fill = biorep), alpha = 0.4) +
+  xlim(-2,2) +
+  theme_classic()
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/dist_bioreps_filt.svg", plot = all4_dist_filtered, width = 10, height = 8)
+```
+
+## Mapping of intreprotein links into Mitocarta 3.0 subcompartment classification (Fig. 2a)
+```{r}
+# upload excel tables from XLinkDB
+Mitocarta <- read_excel('C:/Users/BruceLab/Downloads/Mouse.MitoCarta3.0.xls')
+
+Mitocarta_local <- Mitocarta %>%
+  select(Symbol, MitoCarta3.0_SubMitoLocalization) %>%
+  rename(gene = Symbol)
+
+
+# make a dataframe with XLs, gene names, ratios, p-values
+XL_mito_compartment <- input_all %>%
+  mutate(crosslink = str_c(pepA, "_", modposA, "_", pepB, "_", modposB)) %>%
+  select(crosslink, uniprotA, uniprotB, modposA, modposB, geneA, geneB, NetworkDistance) %>%
+  mutate(XL_protein_name = str_c(uniprotA, "_", modposA, "_", uniprotB, "_", modposB)) %>%
+  mutate(XL_protein_name = str_remove_all(XL_protein_name, "_MOUSE")) %>%
+  filter(str_detect(NetworkDistance, "Intra") == FALSE) %>%
+  filter(str_detect(NetworkDistance, "N/A") == FALSE) %>%
+  rename(gene = geneA)
+
+
+XL_localized <- left_join(XL_mito_compartment, Mitocarta_local, by = "gene") %>%
+  rename(geneA_local = MitoCarta3.0_SubMitoLocalization) %>%
+  rename(geneA = gene) %>%
+  rename(gene = geneB)
+
+
+XL_localized_both <- left_join(XL_localized, Mitocarta_local, by = "gene") %>%
+  rename(geneB_local = MitoCarta3.0_SubMitoLocalization) %>%
+  rename(geneB = gene) %>%
+  mutate(localized_pair = str_c(geneA_local, geneB_local, sep = "_")) %>%
+  mutate(localization = case_when(geneA_local == geneB_local ~ geneB_local,
+                                  geneA_local != geneB_local ~localized_pair)) %>%
+  mutate(localization = case_when(str_detect(localized_pair, "MOM") == TRUE & str_detect(localized_pair, "MIM")                                   == TRUE ~ "OM_IM", TRUE ~ localization)) %>% 
+  mutate(localization = case_when(str_detect(localized_pair, "Matrix") == TRUE & str_detect(localized_pair, "MIM")                                   == TRUE ~ "Matrix_IM", TRUE ~ localization))
+  
+
+interlink_localization <- ggplot(XL_localized_both, aes(x = localization)) +
+  geom_bar() +
+  theme_classic() +
+  geom_text(stat = "count", aes(label = ..count..)) +
+  scale_x_discrete(limits = c("MIM","Matrix_IM", "Matrix", "OM_IM", "Matrix_MOM", "MOM"))
+
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/interlink_localization.svg", plot = interlink_localization, width = 10, height = 8)
+
+```
+
+
+## confidently quantified XLS in all biological replicates ofr heat map generation (Fig. 2d)
+```{r}
+heat_map_mito_ordered_all <- old_young_all_quants_filtered %>%
+  filter(!is.na(log2ratio_1_Sample_1) & !is.na(log2ratio_2_Sample_2) & !is.na(log2ratio_3_Sample_3) &!is.na(log2ratio_4_Sample_4)) %>%
+  filter(`95pctconf_1_Sample_1` < 0.5 & `95pctconf_2_Sample_2` < 0.5 & `95pctconf_3_Sample_3` < 0.5 & `95pctconf_3_Sample_3` < 0.5) %>%
+  select(XL_protein_name, log2ratio_1_Sample_1, log2ratio_2_Sample_2, log2ratio_3_Sample_3, log2ratio_4_Sample_4, log2ratio_5_Combined_ratio) %>%
+  arrange(log2ratio_5_Combined_ratio) %>%
+  select(-log2ratio_5_Combined_ratio)
+
+write.csv(heat_map_mito_ordered_all, 'C:/Users/BruceLab/Desktop/heat_map_mito_ordered_all.csv')
+```
+
+
+## Pairwise correlations of log2 ratios across biological replicates (Fir. 2c)
+```{r}
+
+library(GGally)
+
+## log2 ratios of crosslinks quantified in each replicate with 95% confidence < 0.5
+pairwise_correlations <- heat_map_mito_ordered_all %>%
+    select(log2ratio_1_Sample_1, log2ratio_2_Sample_2, log2ratio_3_Sample_3, log2ratio_4_Sample_4)
+
+
+ggpairs_mito <- ggpairs(pairwise_correlations, ggplot2:: aes()) +
+  theme_classic() +
+  xlim(-1.7,1.8) 
+
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/pairwise_corr_3_samples.svg", plot = ggpairs_mito, width = 10, height = 8)
+```
+
+
+## Difference to the mean between miscleavaged and oxidated crosslinsk (Fig. S1b)
+```{r}
+# crosslinks by site
+mito_by_site <- old_young_all_quants_filtered %>%
+  group_by(XL_protein_name) %>%
+  mutate(stdev = sd(log2ratio_5_Combined_ratio)) %>%
+  mutate(site_mean = mean(log2ratio_5_Combined_ratio)) %>%
+  ungroup() %>%
+  rowwise() %>%
+  mutate(diff_to_mean = abs(site_mean - log2ratio_5_Combined_ratio)) %>%
+  filter(!is.na(stdev))
+
+# differences to the mean for crosslinks at the same site
+mito_diff_to_mean <- ggplot(mito_by_site, aes(x = diff_to_mean)) +
+  geom_histogram(binwidth = 0.025) +
+  theme_classic()
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/mito_diff_to_mean.svg", plot = mito_diff_to_mean, width = 10, height = 8)
+```
+
+
+## DHE3 t-test and boxplot (Fig. 4d)
+```{r}
+
+relevant_res_pairs <- old_young_all_quants_filtered %>%
+  group_by(XL_protein_name) %>%
+  mutate(site_mean = mean(log2ratio_5_Combined_ratio)) %>%
+  ungroup() 
+
+res_pairs_long <- relevant_res_pairs %>%
+  pivot_longer(c(log2ratio_1_Sample_1, log2ratio_2_Sample_2, log2ratio_3_Sample_3, log2ratio_4_Sample_4), names_to = "biorep", values_to = "log2ratio")
+
+DHE_res_pairs <- res_pairs_long %>%
+  filter(str_detect(XL_protein_name, "DHE3")) %>%
+  mutate(localization = case_when(str_detect(XL_protein_name, "DHE3_4") == TRUE ~ "antenna", TRUE  ~ "body")) %>%
+  filter(!is.na(log2ratio))
+
+DHE3_quant_boxplot <- ggplot(DHE_res_pairs, aes(x = localization, y = log2ratio, fill = localization)) +
+  geom_boxplot() +
+  geom_point(size = 2,  position=position_jitter(h=0.15,w=0.15), alpha = 0.3) +
+  # geom_bar(data = CI_ave, stat = "identity", alpha = 0.3) + 
+  ylim(-1.8,1.8) +
+  theme_bw() +
+  scale_fill_brewer(palette="Set1")
+
+
+DHE3_t_test <- DHE_res_pairs %>%
+  select(log2ratio, localization) %>%
+  group_by(localization) %>%
+  rename(value = log2ratio) %>%
+  nest() %>%
+  spread(key = localization, value = data) %>%
+  mutate(t_test = map2(antenna, body, ~{t.test(.x$value, .y$value) %>% tidy()}),
+         antenna = map(antenna, nrow),
+         body = map(body, nrow)) %>%
+  unnest(c(antenna, body, t_test))
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/DHE3_boxplot.svg", plot = DHE3_quant_boxplot, width = 10, height = 8)
+```
+
+## CI t-test and bar plot (Fig. 3d and S2c)
+```{r}
+
+ETC_CI_res_pairs <- res_pairs_long %>%
+  filter(str_detect(XL_protein_name, "NDUS1") | str_detect(XL_protein_name, "NDUV1")) %>%
+  mutate(localization = case_when(str_detect(XL_protein_name, "NDUS1") == TRUE & str_detect(XL_protein_name, "NDUV1") ~ "assembly", TRUE  ~ "other")) %>%
+  filter(!is.na(log2ratio)) %>%
+  filter(str_detect(geneB, "Ndu") == TRUE)
+  #mutate(localization = factor(localization, levels = c(0,1), labels = c("antenna", "body")))
+
+# boxplots based on all 4 bioreplicates
+CI_boxplot <- ggplot(ETC_CI_res_pairs, aes(x = localization, y = log2ratio, fill = localization)) +
+  geom_boxplot() +
+  geom_point(size = 2,  position=position_jitter(h=0.15,w=0.15), alpha = 0.3) +
+  # geom_bar(data = CI_ave, stat = "identity", alpha = 0.3) + 
+  ylim(-1.8,1.8) +
+  theme_bw() +
+  scale_fill_brewer(palette="Set1")
+
+CI_no_biorep_1 <- ETC_CI_res_pairs %>%
+  filter(!str_detect(biorep, "Sample_1"))
+
+
+# boxplots excluding replicate 1
+CI_boxplot_no_biorep_1 <- ggplot(CI_no_biorep_1, aes(x = localization, y = log2ratio, fill = localization)) +
+  geom_boxplot() +
+  geom_point(size = 2,  position=position_jitter(h=0.15,w=0.15), alpha = 0.3) +
+  # geom_bar(data = CI_ave, stat = "identity", alpha = 0.3) + 
+  ylim(-1.8,1.8) +
+  theme_bw() +
+  scale_fill_brewer(palette="Set1")
+
+
+CI_t_test_no_rep1 <- CI_no_biorep_1 %>%
+  select(log2ratio, localization) %>%
+  group_by(localization) %>%
+  rename(value = log2ratio) %>%
+  nest() %>%
+  spread(key = localization, value = data) %>%
+  mutate(t_test = map2(assembly, other, ~{t.test(.x$value, .y$value) %>% tidy()}),
+         assembly = map(assembly, nrow),
+         other = map(other, nrow)) %>%
+  unnest(c(assembly, other, t_test))
+
+CI_t_test <- ETC_CI_res_pairs %>%
+  select(log2ratio, localization) %>%
+  group_by(localization) %>%
+  rename(value = log2ratio) %>%
+  nest() %>%
+  spread(key = localization, value = data) %>%
+  mutate(t_test = map2(assembly, other, ~{t.test(.x$value, .y$value) %>% tidy()}),
+         assembly = map(assembly, nrow),
+         other = map(other, nrow)) %>%
+  unnest(c(assembly, other, t_test))
+  
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/CI_boxplot.svg", plot = CI_boxplot_no_biorep_1, width = 10, height = 8)
+
+```
+
+
+##CIV t-test and box-pot (Fig. 3h and S2d)
+```{r}
+CIV_res_pairs <- res_pairs_long %>%
+  filter(str_detect(XL_protein_name, "NDUA4") | str_detect(XL_protein_name, "CX6B1")) %>%
+  mutate(localization = case_when(str_detect(XL_protein_name, "NDUA") == TRUE ~ "inter", TRUE  ~ "other")) %>%
+  filter(!is.na(log2ratio)) %>%
+  filter(str_detect(XL_protein_name, "ECH") == FALSE)
+  #mutate(localization = factor(localization, levels = c(0,1), labels = c("antenna", "body")))
+
+CIV_ave <- CIV_res_pairs %>%
+  group_by(localization) %>%
+  summarize(log2ratio = mean(log2ratio))
+
+CIV_boxplot <- ggplot(CIV_res_pairs, aes(x = localization, y = log2ratio, fill = localization)) +
+  geom_boxplot() +
+  geom_point(size = 2,  position=position_jitter(h=0.15,w=0.15), alpha = 0.3) +
+  # geom_bar(data = CI_ave, stat = "identity", alpha = 0.3) + 
+  ylim(-1.8,1.8) +
+  theme_bw() +
+  scale_fill_brewer(palette="Set1")
+
+CIV_no_biorep_1 <- CIV_res_pairs %>%
+  filter(!str_detect(biorep, "Sample_1"))
+
+CIV_boxplot_no_biorep_1 <- ggplot(CIV_no_biorep_1, aes(x = localization, y = log2ratio, fill = localization)) +
+  geom_boxplot() +
+  geom_point(size = 2,  position=position_jitter(h=0.15,w=0.15), alpha = 0.3) +
+  # geom_bar(data = CI_ave, stat = "identity", alpha = 0.3) + 
+  ylim(-1.8,1.8) +
+  theme_bw() +
+  scale_fill_brewer(palette="Set1")
+
+
+CIV_t_test_no_rep1 <- CIV_no_biorep_1 %>%
+  select(log2ratio, localization) %>%
+  group_by(localization) %>%
+  rename(value = log2ratio) %>%
+  nest() %>%
+  spread(key = localization, value = data) %>%
+  mutate(t_test = map2(inter, other, ~{t.test(.x$value, .y$value) %>% tidy()}),
+         inter = map(inter, nrow),
+         other = map(other, nrow)) %>%
+  unnest(c(inter, other, t_test))
+
+CIV_t_test <- CIV_res_pairs %>%
+  select(log2ratio, localization) %>%
+  group_by(localization) %>%
+  rename(value = log2ratio) %>%
+  nest() %>%
+  spread(key = localization, value = data) %>%
+  mutate(t_test = map2(inter, other, ~{t.test(.x$value, .y$value) %>% tidy()}),
+         inter = map(inter, nrow),
+         other = map(other, nrow)) %>%
+  unnest(c(inter, other, t_test))
+  
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/CIV_boxplot.svg", plot = CIV_boxplot_no_biorep_1, width = 10, height = 8)
+```
+
+## FAO t-tests and boxplots (Fig. 5 h-j, S4c)
+```{r}
+
+ACADVL_res_pairs <- res_pairs_long %>%
+  filter(str_detect(XL_protein_name, "ACADV")) %>%
+  mutate(localization = case_when(str_detect(XL_protein_name, "279") == TRUE | str_detect(XL_protein_name, "483") | str_detect(XL_protein_name, "557") ~ "CoA", TRUE  ~ "other")) %>%
+  filter(!is.na(log2ratio)) %>%
+  filter(!str_detect(XL_protein_name, "AATM") == TRUE) %>%
+  filter(!str_detect(XL_protein_name, "ATPD") == TRUE) 
+
+ACADVL_ave <- ACADVL_res_pairs %>%
+  group_by(localization) %>%
+  summarize(log2ratio = mean(log2ratio))
+
+ACADVL_boxplot <- ggplot(ACADVL_res_pairs, aes(x = localization, y = log2ratio, fill = localization)) +
+  geom_boxplot() +
+  geom_point(size = 2,  position=position_jitter(h=0.15,w=0.15), alpha = 0.3) +
+  # geom_bar(data = CI_ave, stat = "identity", alpha = 0.3) + 
+  ylim(-1.8,1.8) +
+  theme_bw() +
+  scale_fill_brewer(palette="Set1")
+
+ACADVL_no_biorep_1 <- ACADVL_res_pairs %>%
+  filter(!str_detect(biorep, "Sample_1"))
+
+ACADVL_no_biorep_1_boxplot <- ggplot(ACADVL_no_biorep_1, aes(x = localization, y = log2ratio, fill = localization)) +
+  geom_boxplot() +
+  geom_point(size = 4,  position=position_jitter(h=0.15,w=0.15), alpha = 0.3) +
+  # geom_bar(data = CI_ave, stat = "identity", alpha = 0.3) + 
+  ylim(-1.8,1.8) +
+  theme_bw() +
+  scale_fill_brewer(palette="Set1")
+
+
+ACADVL_t_test_no_rep1 <- ACADVL_no_biorep_1 %>%
+  select(log2ratio, localization) %>%
+  group_by(localization) %>%
+  rename(value = log2ratio) %>%
+  nest() %>%
+  spread(key = localization, value = data) %>%
+  mutate(t_test = map2(CoA, other, ~{t.test(.x$value, .y$value) %>% tidy()}),
+         CoA = map(CoA, nrow),
+         other = map(other, nrow)) %>%
+  unnest(c(CoA, other, t_test))
+
+ACADVL_t_test <- ACADVL_res_pairs %>%
+  select(log2ratio, localization) %>%
+  group_by(localization) %>%
+  rename(value = log2ratio) %>%
+  nest() %>%
+  spread(key = localization, value = data) %>%
+   mutate(t_test = map2(CoA, other, ~{t.test(.x$value, .y$value) %>% tidy()}),
+         CoA = map(CoA, nrow),
+         other = map(other, nrow)) %>%
+  unnest(c(CoA, other, t_test))
+  
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/ACADVL_no_biorep_1_boxplot.svg", plot = ACADVL_no_biorep_1_boxplot, width = 10, height = 8)
+
+
+
+SUCA_res_pairs <- res_pairs_long %>%
+  filter(str_detect(XL_protein_name, "SUC")) %>%
+  mutate(localization = case_when(str_detect(XL_protein_name, "57") == TRUE | str_detect(XL_protein_name, "66") ~ "CoA", str_detect(XL_protein_name, "143") == TRUE~ "GTP", TRUE  ~ "other")) %>%
+  filter(!is.na(log2ratio))
+
+
+SUCA_ave <- SUCA_res_pairs %>%
+  group_by(localization) %>%
+  summarize(log2ratio = mean(log2ratio))
+
+SUCA_boxplot <- ggplot(SUCA_res_pairs, aes(x = reorder(localization, log2ratio,  FUN = mean), y = log2ratio, fill = localization)) +
+  geom_boxplot() +
+  geom_point(size = 4,  position=position_jitter(h=0.15,w=0.15), alpha = 0.3) +
+  # geom_bar(data = CI_ave, stat = "identity", alpha = 0.3) + 
+  ylim(-1.8,1.8) +
+  theme_bw() +
+  scale_fill_brewer(palette="Set1")
+
+SUCA_CoA_t_test <- SUCA_res_pairs %>%
+  select(log2ratio, localization) %>%
+  group_by(localization) %>%
+  rename(value = log2ratio) %>%
+  nest() %>%
+  spread(key = localization, value = data) %>%
+   mutate(t_test = map2(CoA, other, ~{t.test(.x$value, .y$value) %>% tidy()}),
+         CoA = map(CoA, nrow),
+         other = map(other, nrow)) %>%
+  unnest(c(CoA, other, t_test))
+
+SUCA_GTP_t_test <- SUCA_res_pairs %>%
+  select(log2ratio, localization) %>%
+  group_by(localization) %>%
+  rename(value = log2ratio) %>%
+  nest() %>%
+  spread(key = localization, value = data) %>%
+   mutate(t_test = map2(GTP, other, ~{t.test(.x$value, .y$value) %>% tidy()}),
+         GTP = map(GTP, nrow),
+         other = map(other, nrow)) %>%
+  unnest(c(GTP, other, t_test))
+  
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/SUCA_boxplot.svg", plot = SUCA_boxplot, width = 10, height = 8)
+
+
+
+THIL_res_pairs <- res_pairs_long %>%
+  filter(str_detect(XL_protein_name, "THIL")) %>%
+  mutate(localization = case_when(str_detect(XL_protein_name, "260") == TRUE & str_detect(XL_protein_name, "265") ~ "CoA", str_detect(XL_protein_name, "242") == TRUE | str_detect(XL_protein_name, "260") == TRUE | str_detect(XL_protein_name, "265") == TRUE ~ "tetramer", TRUE  ~ "other")) %>%
+  filter(!is.na(log2ratio))
+
+
+THIL_ave <- THIL_res_pairs %>%
+  group_by(localization) %>%
+  summarize(log2ratio = mean(log2ratio))
+
+
+THIL_boxplot <- ggplot(THIL_res_pairs, aes(x = reorder(localization, log2ratio,  FUN = mean), y = log2ratio, fill = localization)) +
+  geom_boxplot() +
+  geom_point(size = 4,  position=position_jitter(h=0.15,w=0.15), alpha = 0.3) +
+  # geom_bar(data = CI_ave, stat = "identity", alpha = 0.3) + 
+  ylim(-1.8,1.8) +
+  theme_bw() +
+  scale_fill_brewer(palette="Set1")
+
+THIL_CoA_t_test <- THIL_res_pairs %>%
+  select(log2ratio, localization) %>%
+  group_by(localization) %>%
+  rename(value = log2ratio) %>%
+  nest() %>%
+  spread(key = localization, value = data) %>%
+   mutate(t_test = map2(CoA, other, ~{t.test(.x$value, .y$value) %>% tidy()}),
+         CoA = map(CoA, nrow),
+         other = map(other, nrow)) %>%
+  unnest(c(CoA, other, t_test))
+
+THIL_tetramer_t_test <- THIL_res_pairs %>%
+  select(log2ratio, localization) %>%
+  group_by(localization) %>%
+  rename(value = log2ratio) %>%
+  nest() %>%
+  spread(key = localization, value = data) %>%
+   mutate(t_test = map2(tetramer, other, ~{t.test(.x$value, .y$value) %>% tidy()}),
+         tetramer = map(tetramer, nrow),
+         other = map(other, nrow)) %>%
+  unnest(c(tetramer, other, t_test))
+  
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/THIL_boxplot.svg", plot = THIL_boxplot, width = 10, height = 8)
+```
+
+
+
+## correlation of XLs to functional measurements
+```{r}
+input_Gavin <- read_excel('C:/Users/BruceLab/Documents/old_young_mice_mito/functional_log2_change.xlsx')
+
+
+CI_func_comp <- old_young_all_quants_filtered %>%
+  filter(str_detect(XL_protein_name, "NDUS1") | str_detect(XL_protein_name, "NDUV1")) %>%
+  mutate(localization = case_when(str_detect(XL_protein_name, "NDUS1") == TRUE & str_detect(XL_protein_name, "NDUV1") ~ "assembly", TRUE  ~ "other")) %>%
+  filter(str_detect(localization, "assembly")) %>%
+  summarise(P1 = mean(log2ratio_1_Sample_1, na.rm = TRUE),
+            P2 = mean(log2ratio_2_Sample_2, na.rm = TRUE),
+            P3 = mean(log2ratio_3_Sample_3, na.rm = TRUE),
+            P4 = mean(log2ratio_4_Sample_4, na.rm = TRUE)) %>%
+  pivot_longer(c(P1, P2, P3, P4), names_to = "biorep", values_to = "CI_XL_ave")
+
+funct_data <- left_join(input_Gavin, CI_func_comp, by = "biorep")
+
+
+CIV_func_comp <- old_young_all_quants_filtered %>%
+  filter(str_detect(XL_protein_name, "NDUA4") | str_detect(XL_protein_name, "CX6B1")) %>%
+  mutate(localization = case_when(str_detect(XL_protein_name, "NDUA") == TRUE ~ "inter", TRUE  ~ "other")) %>%
+  filter(str_detect(XL_protein_name, "ECH") == FALSE) %>%
+  filter(str_detect(localization, "inter")) %>%
+   summarise(P1 = mean(log2ratio_1_Sample_1, na.rm = TRUE),
+            P2 = mean(log2ratio_2_Sample_2, na.rm = TRUE),
+            P3 = mean(log2ratio_3_Sample_3, na.rm = TRUE),
+            P4 = mean(log2ratio_4_Sample_4, na.rm = TRUE)) %>%
+  pivot_longer(c(P1, P2, P3, P4), names_to = "biorep", values_to = "CIV_XL_ave")
+
+funct_data <- left_join(funct_data, CIV_func_comp, by = "biorep") 
+
+DHE_func_comp <- mito_old_young %>%
+  filter(str_detect(XL_protein_name, "DHE3")) %>%
+  mutate(localization = case_when(str_detect(XL_protein_name, "DHE3_4") == TRUE ~ "antenna", TRUE  ~ "body")) %>%
+  filter(str_detect(localization, "antenna")) %>%
+   summarise(P1 = mean(log2ratio_1_Sample_1, na.rm = TRUE),
+            P2 = mean(log2ratio_2_Sample_2, na.rm = TRUE),
+            P3 = mean(log2ratio_3_Sample_3, na.rm = TRUE),
+            P4 = mean(log2ratio_4_Sample_4, na.rm = TRUE)) %>%
+  pivot_longer(c(P1, P2, P3, P4), names_to = "biorep", values_to = "DHE3_XL_ave")
+
+funct_data <- left_join(funct_data, DHE_func_comp, by = "biorep") 
+
+DHE_func_comp_non_antenna <- old_young_all_quants_filtered %>%
+  filter(str_detect(XL_protein_name, "DHE3")) %>%
+  mutate(localization = case_when(str_detect(XL_protein_name, "DHE3_4") == TRUE ~ "antenna", TRUE  ~ "body")) %>%
+  filter(str_detect(localization, "body")) %>%
+   summarise(P1 = mean(log2ratio_1_Sample_1, na.rm = TRUE),
+            P2 = mean(log2ratio_2_Sample_2, na.rm = TRUE),
+            P3 = mean(log2ratio_3_Sample_3, na.rm = TRUE),
+            P4 = mean(log2ratio_4_Sample_4, na.rm = TRUE)) %>%
+  pivot_longer(c(P1, P2, P3, P4), names_to = "biorep", values_to = "DHE3_XL_ave_body")
+
+funct_data <- left_join(funct_data, DHE_func_comp_non_antenna, by = "biorep")
+
+ACADVL_res_pairs <- old_young_all_quants_filtered %>%
+  filter(str_detect(XL_protein_name, "ACADV")) %>%
+  mutate(localization = case_when(str_detect(XL_protein_name, "279") == TRUE | str_detect(XL_protein_name, "483") | str_detect(XL_protein_name, "557") ~ "CoA", TRUE  ~ "other")) %>%
+  filter(!str_detect(XL_protein_name, "AATM") == TRUE) %>%
+  filter(!str_detect(XL_protein_name, "ATPD") == TRUE) %>%
+  summarise(P1 = mean(log2ratio_1_Sample_1, na.rm = TRUE),
+            P2 = mean(log2ratio_2_Sample_2, na.rm = TRUE),
+            P3 = mean(log2ratio_3_Sample_3, na.rm = TRUE),
+            P4 = mean(log2ratio_4_Sample_4, na.rm = TRUE)) %>%
+  pivot_longer(c(P1, P2, P3, P4), names_to = "biorep", values_to = "ACADVL_XL_ave")
+
+
+funct_data <- left_join(funct_data, ACADVL_res_pairs, by = "biorep") 
+
+CI_oxphos_corr_DHE3 <- ggplot(funct_data) +
+  #geom_point(aes(x = CI_oxphos, y = CI_XL_ave), color = '#0099FF', shape = 16, size = 6) +
+  #geom_smooth(aes(x = CI_oxphos, y = CI_XL_ave), method=lm, se = FALSE, color = "#0099FF") +
+  #geom_point(aes(x = CI_oxphos, y = CIV_XL_ave), color = "indianred1", shape = 15, size = 6) +
+  #geom_smooth(aes(x = CI_oxphos, y = CIV_XL_ave), method=lm, se = FALSE, color = "indianred1") +
+  geom_point(aes(x = CI_oxphos, y = DHE3_XL_ave), color = "#9933FF", shape = 17, size = 6) +
+  geom_smooth(aes(x = CI_oxphos, y = DHE3_XL_ave), method=lm, se = FALSE, color = "#9933FF") +
+  #geom_point(aes(x = CI_oxphos, y = ACADVL_XL_ave), color = "seagreen3", shape = 18, size = 6) +
+  #geom_smooth(aes(x = CI_oxphos, y = ACADVL_XL_ave), method=lm, se = FALSE, color = "seagreen3") +
+  theme_classic() +
+  xlim(-2.3, 0.5) +
+  ylim(-2.0, 0.0)
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/CI_oxphos_corr_DHE3.svg", plot = CI_oxphos_corr_DHE3, width = 10, height = 8)
+
+
+corr_cI_func <- lm(CI_oxphos ~ CI_XL_ave, data = funct_data)
+summary(corr_cI_func)
+
+corr_cIV_func <- lm(CI_oxphos ~ CIV_XL_ave, data = funct_data)
+summary(corr_cIV_func)
+
+corr_DHE3_func <- lm(CI_oxphos ~ DHE3_XL_ave, data = funct_data)
+summary(corr_DHE3_func)
+
+corr_ACADVL_func <- lm(CI_oxphos ~ ACADVL_XL_ave, data = funct_data)
+summary(corr_ACADVL_func)
+
+corr_CI_oxphos <- lm(CI_oxphos ~ CI_XL_ave + CIV_XL_ave + DHE3_XL_ave + ACADVL_XL_ave, data = funct_data)
+summary(corr_CI_oxphos)
+
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/CI_oxphos_corr.svg", plot = CI_oxphos_corr, width = 10, height = 8)
+
+
+CI_mito_yield_corr_DHE3 <- ggplot(funct_data) +
+  # geom_point(aes(x = mito_yield, y = CI_XL_ave), color = '#0099FF', shape = 16, size = 4) +
+  # geom_smooth(aes(x = mito_yield, y = CI_XL_ave), method=lm, se = FALSE, color = "#0099FF") +
+  # geom_point(aes(x = mito_yield, y = CIV_XL_ave), color = "#00CC00", shape = 15, size = 4) +
+  # geom_smooth(aes(x = mito_yield, y = CIV_XL_ave), method=lm, se = FALSE, color = "#00CC00") +
+  geom_point(aes(x = mito_yield, y = DHE3_XL_ave_body), color = "#9933FF", shape = 17, size = 8) +
+  geom_smooth(aes(x = mito_yield, y = DHE3_XL_ave_body), method=lm, se = FALSE, color = "#9933FF") +
+  # geom_point(aes(x = mito_yield, y = ACADVL_XL_ave), color = "brown1", shape = 18, size = 4) +
+  # geom_smooth(aes(x = mito_yield, y = ACADVL_XL_ave), method=lm, se = FALSE, color = "brown1") +
+  theme_classic() 
+  # xlim(-1.5, -0.5) +
+  # ylim(-2.0, 0.5) 
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/CI_mito_yield_corr_DHE3.svg", plot = CI_mito_yield_corr_DHE3, width = 10, height = 8)
+
+
+corr_cI_yield <- lm(mito_yield ~ CI_XL_ave, data = funct_data)
+summary(corr_cI_yield)
+
+corr_cIV_yield <- lm(mito_yield ~ CIV_XL_ave, data = funct_data)
+summary(corr_cIV_yield)
+
+corr_DHE3_yield <- lm(mito_yield ~ DHE3_XL_ave, data = funct_data)
+summary(corr_DHE3_yield)
+
+corr_ACADVL_yield <- lm(mito_yield ~ ACADVL_XL_ave, data = funct_data)
+summary(corr_ACADVL_yield)
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/CI_mito_yield_corr.svg", plot = CI_mito_yield_corr, width = 10, height = 8)
+
+
+CI_CS_activity_corr_DHE3 <- ggplot(funct_data) +
+  # geom_point(aes(x = CS_activity, y = CI_XL_ave), color = '#0099FF', shape = 16, size = 4) +
+  # geom_smooth(aes(x = CS_activity, y = CI_XL_ave), method=lm, se = FALSE, color = "#0099FF") +
+  # geom_point(aes(x = CS_activity, y = CIV_XL_ave), color = "#00CC00", shape = 15, size = 4) +
+  # geom_smooth(aes(x = CS_activity, y = CIV_XL_ave), method=lm, se = FALSE, color = "#00CC00") +
+  geom_point(aes(x = CS_activity, y = DHE3_XL_ave), color = "#9933FF", shape = 17, size = 8) +
+  geom_smooth(aes(x = CS_activity, y = DHE3_XL_ave), method=lm, se = FALSE, color = "#9933FF") +
+  # geom_point(aes(x = CS_activity, y = ACADVL_XL_ave), color = "brown1", shape = 18, size = 4) +
+  # geom_smooth(aes(x = CS_activity, y = ACADVL_XL_ave), method=lm, se = FALSE, color = "brown1") +
+  theme_classic() 
+  # xlim(-1.5, -0.5) +
+  # ylim(-2.0, 0.5) 
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/CI_CS_activity_corr_DHE3.svg", plot = CI_CS_activity_corr_DHE3, width = 10, height = 8)
+
+
+corr_cI_CS_activity <- lm(CS_activity ~ CI_XL_ave, data = funct_data)
+summary(corr_cI_CS_activity)
+
+corr_CIV_CS_activity <- lm(CS_activity ~ CIV_XL_ave, data = funct_data)
+summary(corr_CIV_CS_activity)
+
+corr_DHE3_CS_activity <- lm(CS_activity ~ DHE3_XL_ave, data = funct_data)
+summary(corr_DHE3_CS_activity)
+
+corr_ACADVL_CS_activity <- lm(CS_activity ~ ACADVL_XL_ave, data = funct_data)
+summary(corr_ACADVL_CS_activity)
+
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/CI_CS_activity_corr.svg", plot = CI_CS_activity_corr, width = 10, height = 8)
+
+
+CI_oxphos_corr_fig3 <- ggplot(funct_data) +
+  geom_point(aes(x = CI_oxphos, y = CI_XL_ave), color = '#0099FF', shape = 16, size = 8) +
+  geom_smooth(aes(x = CI_oxphos, y = CI_XL_ave), method=lm, se = FALSE, color = "#0099FF") +
+  geom_point(aes(x = CI_oxphos, y = CIV_XL_ave), color = "orange3", shape = 15, size = 8) +
+  geom_smooth(aes(x = CI_oxphos, y = CIV_XL_ave), method=lm, se = FALSE, color = "orange3") +
+  # geom_point(aes(x = CI_oxphos, y = DHE3_XL_ave), color = "#9933FF", shape = 17, size = 4) +
+  # geom_smooth(aes(x = CI_oxphos, y = DHE3_XL_ave), method=lm, se = FALSE, color = "#9933FF") +
+  # geom_point(aes(x = CI_oxphos, y = ACADVL_XL_ave), color = "brown1", shape = 18, size = 4) +
+  # geom_smooth(aes(x = CI_oxphos, y = ACADVL_XL_ave), method=lm, se = FALSE, color = "brown1") +
+  theme_classic() +
+  xlim(-2.3, 0.5) +
+  ylim(-2.0, 0.5)
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/CI_oxphos_corr_fig3.svg", plot = CI_oxphos_corr_fig3, width = 10, height = 8)
+
+CII_oxphos_corr_CI <- ggplot(funct_data) +
+  geom_point(aes(x = CII_oxphos, y = CI_XL_ave), color = '#0099FF', shape = 16, size = 8) +
+  geom_smooth(aes(x = CII_oxphos, y = CI_XL_ave), method=lm, se = FALSE, color = "#0099FF") +
+  geom_point(aes(x = CII_oxphos, y = CIV_XL_ave), color = "orange3", shape = 15, size = 8) +
+  geom_smooth(aes(x = CII_oxphos, y = CIV_XL_ave), method=lm, se = FALSE, color = "orange3") +
+  geom_point(aes(x = CII_oxphos, y = DHE3_XL_ave), color = "#9933FF", shape = 17, size = 4) +
+  geom_smooth(aes(x = CII_oxphos, y = DHE3_XL_ave), method=lm, se = FALSE, color = "#9933FF") +
+  # geom_point(aes(x = CI_oxphos, y = ACADVL_XL_ave), color = "brown1", shape = 18, size = 4) +
+  # geom_smooth(aes(x = CI_oxphos, y = ACADVL_XL_ave), method=lm, se = FALSE, color = "brown1") +
+  theme_classic()
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/CII_oxphos_corr.svg", plot = CII_oxphos_corr_CI, width = 10, height = 8)
+
+corr_cI_CII_resp <- lm(CII_oxphos ~ CI_XL_ave, data = funct_data)
+summary(corr_cI_CII_resp)
+
+corr_CIV_CII_resp <- lm(CII_oxphos ~ CIV_XL_ave, data = funct_data)
+summary(corr_CIV_CII_resp)
+
+corr_DHE3_CII_resp <- lm(CII_oxphos ~ DHE3_XL_ave, data = funct_data)
+summary(corr_DHE3_CII_resp)
+
+CII_oxphos_corr_DHE3 <- ggplot(funct_data) +
+  #geom_point(aes(x = CI_oxphos, y = CI_XL_ave), color = '#0099FF', shape = 16, size = 6) +
+  #geom_smooth(aes(x = CI_oxphos, y = CI_XL_ave), method=lm, se = FALSE, color = "#0099FF") +
+  #geom_point(aes(x = CI_oxphos, y = CIV_XL_ave), color = "indianred1", shape = 15, size = 6) +
+  #geom_smooth(aes(x = CI_oxphos, y = CIV_XL_ave), method=lm, se = FALSE, color = "indianred1") +
+  geom_point(aes(x = CII_oxphos, y = DHE3_XL_ave), color = "#9933FF", shape = 17, size = 6) +
+  geom_smooth(aes(x = CII_oxphos, y = DHE3_XL_ave), method=lm, se = FALSE, color = "#9933FF") +
+  #geom_point(aes(x = CI_oxphos, y = ACADVL_XL_ave), color = "seagreen3", shape = 18, size = 6) +
+  #geom_smooth(aes(x = CI_oxphos, y = ACADVL_XL_ave), method=lm, se = FALSE, color = "seagreen3") +
+  theme_classic() +
+  xlim(-1.0, 0.5) +
+  ylim(-2.0, 0.0)
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/CII_oxphos_corr_DHE3.svg", plot = CII_oxphos_corr_DHE3, width = 10, height = 8)
+
+```
+
+
+## K-means clusters (Fig. 6c)
+```{r}
+pre_melt <- old_young_all_quants_filtered %>%
+  select(XL_protein_name, crosslink,starts_with("log2ratio"), K_means_5) %>%
+  select(-log2ratio_5_Combined_ratio)
+
+
+names(pre_melt) = c("prot_XL", "xldbID", "1", "4", "2", "3", "k_means") #rename pre-pivot
+
+XL_for_melt <- pre_melt %>%
+  select(xldbID, '1', '2', '3', '4', "k_means")
+
+XL_melt <- XL_for_melt %>% 
+  pivot_longer(c('1', '2', '3', '4'), names_to = "CI_oxphos", values_to = "log2ratio") %>%
+  mutate(CI_oxphos = as.numeric(CI_oxphos))
+
+ggplot(XL_melt, aes(x = CI_oxphos, y = log2ratio, group = xldbID)) + 
+  geom_line() +
+  theme_classic()
+
+
+XL_for_melt_E <- pre_melt %>%
+  filter(str_detect(k_means, "E")) %>%
+  select(prot_XL, xldbID, '1', '2', '3', '4', "k_means")
+
+XL_melt_E <- XL_for_melt_E %>% 
+  pivot_longer(c('1', '2', '3', '4'), names_to = "CI_oxphos", values_to = "log2ratio") %>%
+  mutate(CI_oxphos = as.numeric(CI_oxphos)) 
+
+melt_E <- ggplot(XL_melt, aes(x = CI_oxphos, y = log2ratio, group = xldbID)) + 
+  geom_line(color = 'grey57', alpha = 0.4) +
+  geom_point(data = XL_melt_E, aes(x = CI_oxphos, y = log2ratio), size = 2,color = 'blue') +
+  geom_line(data = XL_melt_E, aes(x = CI_oxphos, y = log2ratio,), size = 1,color = 'blue') +
+  #scale_color_manual(values=c("blue", "black")) +
+  theme_classic() +
+  theme(legend.position = "none") 
+
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/melt_E.svg", plot = melt_E, width = 10, height = 8)
+
+XL_for_melt_A <- pre_melt %>%
+  filter(str_detect(k_means, "A")) %>%
+  select(prot_XL, xldbID, '1', '2', '3', '4', "k_means")
+
+XL_melt_A <- XL_for_melt_A %>% 
+  pivot_longer(c('1', '2', '3', '4'), names_to = "CI_oxphos", values_to = "log2ratio") %>%
+  mutate(CI_oxphos = as.numeric(CI_oxphos)) 
+
+melt_A <- ggplot(XL_melt, aes(x = CI_oxphos, y = log2ratio, group = xldbID)) + 
+  geom_line(color = 'grey57', alpha = 0.4) +
+  geom_point(data = XL_melt_A, aes(x = CI_oxphos, y = log2ratio), size = 2,color = 'darkslategrey') +
+  geom_line(data = XL_melt_A, aes(x = CI_oxphos, y = log2ratio,), size = 1,color = 'darkslategrey') +
+  #scale_color_manual(values=c("blue", "black")) +
+  theme_classic() +
+  theme(legend.position = "none") 
+
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/melt_A.svg", plot = melt_A, width = 10, height = 8)
+
+XL_for_melt_B <- pre_melt %>%
+  filter(str_detect(k_means, "B")) %>%
+  select(prot_XL, xldbID, '1', '2', '3', '4', "k_means")
+
+XL_melt_B <- XL_for_melt_B %>% 
+  pivot_longer(c('1', '2', '3', '4'), names_to = "CI_oxphos", values_to = "log2ratio") %>%
+  mutate(CI_oxphos = as.numeric(CI_oxphos)) 
+
+melt_B <- ggplot(XL_melt, aes(x = CI_oxphos, y = log2ratio, group = xldbID)) + 
+  geom_line(color = 'grey57', alpha = 0.4) +
+  geom_point(data = XL_melt_B, aes(x = CI_oxphos, y = log2ratio), size = 2,color = 'midnightblue') +
+  geom_line(data = XL_melt_B, aes(x = CI_oxphos, y = log2ratio,), size = 1,color = 'midnightblue') +
+  #scale_color_manual(values=c("blue", "black")) +
+  theme_classic() +
+  theme(legend.position = "none") 
+
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/melt_B.svg", plot = melt_B, width = 10, height = 8)
+
+XL_for_melt_C <- pre_melt %>%
+  filter(str_detect(k_means, "C")) %>%
+  select(prot_XL, xldbID, '1', '2', '3', '4', "k_means")
+
+XL_melt_C <- XL_for_melt_C %>% 
+  pivot_longer(c('1', '2', '3', '4'), names_to = "CI_oxphos", values_to = "log2ratio") %>%
+  mutate(CI_oxphos = as.numeric(CI_oxphos)) 
+
+melt_C <- ggplot(XL_melt, aes(x = CI_oxphos, y = log2ratio, group = xldbID)) + 
+  geom_line(color = 'grey57', alpha = 0.4) +
+  geom_point(data = XL_melt_C, aes(x = CI_oxphos, y = log2ratio), size = 2,color = 'cornflowerblue') +
+  geom_line(data = XL_melt_C, aes(x = CI_oxphos, y = log2ratio,), size = 1,color = 'cornflowerblue') +
+  #scale_color_manual(values=c("blue", "black")) +
+  theme_classic() +
+  theme(legend.position = "none") 
+
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/melt_C.svg", plot = melt_C, width = 10, height = 8)
+
+XL_for_melt_D <- pre_melt %>%
+  filter(str_detect(k_means, "D")) %>%
+  select(prot_XL, xldbID, '1', '2', '3', '4', "k_means")
+
+XL_melt_D <- XL_for_melt_D %>% 
+  pivot_longer(c('1', '2', '3', '4'), names_to = "CI_oxphos", values_to = "log2ratio") %>%
+  mutate(CI_oxphos = as.numeric(CI_oxphos)) 
+
+melt_D <- ggplot(XL_melt, aes(x = CI_oxphos, y = log2ratio, group = xldbID)) + 
+  geom_line(color = 'grey57', alpha = 0.4) +
+  geom_point(data = XL_melt_D, aes(x = CI_oxphos, y = log2ratio), size = 2,color = 'gold3') +
+  geom_line(data = XL_melt_D, aes(x = CI_oxphos, y = log2ratio,), size = 1,color = 'gold3') +
+  #scale_color_manual(values=c("blue", "black")) +
+  theme_classic() +
+  theme(legend.position = "none") 
+
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/melt_D.svg", plot = melt_D, width = 10, height = 8)
+```
+
+
+## Fig. 6d, DHE3
+```{r}
+# Pre-melt from non filtered quants
+pre_melt_NF <- old_young_all_quants %>%
+  select(XL_protein_name, crosslink,starts_with("log2ratio")) %>%
+  select(-log2ratio_5_Combined_ratio)
+
+
+names(pre_melt_NF) = c("prot_XL", "xldbID", "1", "4", "2", "3", "k_means") #rename pre-pivot
+
+
+XL_for_melt_DHE3 <- pre_melt_NF %>%
+  filter(str_detect(prot_XL, "DHE3")) %>%
+  select(prot_XL, xldbID, '1', '2', '3', '4')
+
+XL_melt_DHE3 <- XL_for_melt_DHE3 %>% 
+  pivot_longer(c('1', '2', '3', '4'), names_to = "CI_oxphos", values_to = "log2ratio") %>%
+  mutate(CI_oxphos = as.numeric(CI_oxphos)) %>%
+  mutate(category = case_when(str_detect(prot_XL, "DHE3_4") == TRUE ~ "antenna", TRUE  ~ "body"))
+
+melt_DHE3 <- ggplot(XL_melt, aes(x = CI_oxphos, y = log2ratio, group = xldbID)) + 
+  geom_line(color = 'grey81', alpha = 0.4) +
+  geom_point(data = XL_melt_DHE3, aes(x = CI_oxphos, y = log2ratio, group = xldbID, color = category), size = 2) +
+  geom_line(data = XL_melt_DHE3, aes(x = CI_oxphos, y = log2ratio, group = xldbID, color = category), size = 1) +
+  scale_color_manual(values=c('#33CCFF',"gray26")) +
+  theme_classic() +
+  theme(legend.position = "none") 
+
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/melt_DHE3.svg", plot = melt_DHE3, width = 10, height = 8)
+
+```
+
+
+## Fig. 6d, complex I and complex IV
+```{r}
+
+XL_for_melt_ETS <- pre_melt %>%
+  filter(str_detect(prot_XL, "NDUS1") | str_detect(prot_XL, "NDUV1") | str_detect(prot_XL, "CX6B1")) %>%
+  mutate(category = case_when (str_detect(prot_XL, "NDUS1") == TRUE & str_detect(prot_XL, "NDUV1") ~ "assembly",  str_detect(prot_XL, "NDUA4") == TRUE ~ "CIV", TRUE  ~ "other")) %>%
+  filter(!str_detect(prot_XL, "MDHM") & !str_detect(prot_XL, "KCRS") & !str_detect(prot_XL, "ECHB") & !str_detect(prot_XL, "IDHG") & !str_detect(prot_XL, "OD") & !str_detect(prot_XL, "TCPH")) %>%
+  select(prot_XL, xldbID, '1', '2', '3', '4', category)
+
+XL_melt_ETS <- XL_for_melt_ETS %>% 
+  pivot_longer(c('1', '2', '3', '4'), names_to = "CI_oxphos", values_to = "log2ratio") %>%
+  mutate(CI_oxphos = as.numeric(CI_oxphos)) 
+
+melt_ETS <- ggplot(XL_melt, aes(x = CI_oxphos, y = log2ratio, group = xldbID)) + 
+  geom_line(color = 'grey81', alpha = 0.4) +
+  geom_point(data = XL_melt_ETS, aes(x = CI_oxphos, y = log2ratio, group = xldbID, color = category), size = 2) +
+  geom_line(data = XL_melt_ETS, aes(x = CI_oxphos, y = log2ratio, group = xldbID, color = category), size = 1) +
+  scale_color_manual(values=c('#33CCFF','#33CCFF',"gray26")) +
+  theme_classic() +
+  theme(legend.position = "none") 
+
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/melt_ETS.svg", plot = melt_ETS, width = 10, height = 8)
+
+```
+
+## Fig. 6d,  TCA/FAO
+```{r}
+
+pre_melt_1 <- old_young_all_quants_filtered %>%
+  select(XL_protein_name, crosslink,starts_with("log2ratio"), K_means_5)
+
+names(pre_melt_1) = c("prot_XL", "xldbID", "1", "4", "2", "3", "comb", "k_means") #rename pre-pivot
+
+
+XL_for_melt_TCA <- pre_melt_1 %>%
+  filter(str_detect(prot_XL, "ACADV") | str_detect(prot_XL, "THIL") | str_detect(prot_XL, "SUC")) %>%
+  mutate(category = case_when (comb > -0.35  ~ "other",  comb < -0.35 ~ "changing")) %>%
+  select(prot_XL, xldbID, '1', '2', '3', '4', category)
+
+XL_melt_TCA <- XL_for_melt_TCA %>% 
+  pivot_longer(c('1', '2', '3', '4'), names_to = "CI_oxphos", values_to = "log2ratio") %>%
+  mutate(CI_oxphos = as.numeric(CI_oxphos)) 
+
+melt_TCA <- ggplot(XL_melt, aes(x = CI_oxphos, y = log2ratio, group = xldbID)) + 
+  geom_line(color = 'grey81', alpha = 0.4) +
+  geom_point(data = XL_melt_TCA, aes(x = CI_oxphos, y = log2ratio, group = xldbID, color = category), size = 2) +
+  geom_line(data = XL_melt_TCA, aes(x = CI_oxphos, y = log2ratio, group = xldbID, color = category), size = 1) +
+  scale_color_manual(values=c('#33CCFF',"gray26")) +
+  theme_classic() +
+  theme(legend.position = "none") 
+
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/melt_TCA.svg", plot = melt_TCA, width = 10, height = 8)
+```
+
+
+## CI all intralinks in all bioreps by the subunit (Fig. S2b)
+```{r}
+complex_I_intra <- old_young_all_quants_filtered %>%
+  filter(str_detect(XL_protein_name, "NDU")) %>%
+  filter(str_detect(NetworkDistance, "Intra"))
+
+Complex_I_intra_long <- complex_I_intra %>%
+  pivot_longer(c(log2ratio_1_Sample_1, log2ratio_2_Sample_2, log2ratio_3_Sample_3, log2ratio_4_Sample_4), names_to = "biorep", values_to = "log2ratio_intra") %>%
+  mutate(Protein = str_remove_all(uniprotA, "_MOUSE"))
+
+CI_all_intra_by_proein <- ggplot(Complex_I_intra_long, aes(x = Protein, y = log2ratio_intra, fill = biorep)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+ggsave(file = "C:/Users/BruceLab/Documents/old_young_mice_mito/CI_all_intra_by_proein.svg", plot = CI_all_intra_by_proein, width = 10, height = 8)
+
+```
+
